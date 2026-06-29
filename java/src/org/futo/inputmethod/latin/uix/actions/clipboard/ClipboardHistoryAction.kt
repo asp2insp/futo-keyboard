@@ -69,12 +69,14 @@ import androidx.core.util.AtomicFile
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.LifecycleCoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -185,6 +187,26 @@ val ClipboardSaveScreenshots = SettingsKey(
 val ClipboardLastBackup = SettingsKey(
     longPreferencesKey("clipboard_last_backup"),
     0
+)
+
+val ClipboardRemoteSyncEnabled = SettingsKey(
+    booleanPreferencesKey("clipboard_remote_sync_enabled"),
+    false
+)
+
+val ClipboardRemoteSyncServerUrl = SettingsKey(
+    stringPreferencesKey("clipboard_remote_sync_server_url"),
+    ""
+)
+
+val ClipboardRemoteSyncToken = SettingsKey(
+    stringPreferencesKey("clipboard_remote_sync_token"),
+    ""
+)
+
+val ClipboardRemoteSyncDeviceName = SettingsKey(
+    stringPreferencesKey("clipboard_remote_sync_device_name"),
+    ""
 )
 
 
@@ -469,6 +491,8 @@ class ClipboardHistoryManager(val context: Context, val coroutineScope: Lifecycl
     }
 
     private val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    private val syncManager = ClipboardSyncManager(context)
+    private var lastSyncedHash: String? = null
 
     val clipboardHistory = mutableStateListOf<ClipboardEntry>()
 
@@ -572,6 +596,7 @@ class ClipboardHistoryManager(val context: Context, val coroutineScope: Lifecycl
                 mimeTypes = listOf(targetMime)
             )
             clipboardHistory.add(newEntry)
+            pushToRemote(newEntry)
         }catch(e: Exception) {
             throwIfDebug(e)
         } finally {
@@ -641,11 +666,99 @@ class ClipboardHistoryManager(val context: Context, val coroutineScope: Lifecycl
                     clipboardHistory.add(newEntry)
 
                     saveClipboard()
+                    pushToRemote(newEntry)
                 }else if (uri != null && canSaveImages) {
                     onImageAdded(mimeTypes, uri, timestamp)
                 }
             }
         }
+
+    private fun computeHash(entry: ClipboardEntry): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        entry.text?.let { digest.update(it.toByteArray()) }
+        entry.backingFile?.let { digest.update(it.toByteArray()) }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun pushToRemote(entry: ClipboardEntry) {
+        val hash = computeHash(entry)
+        if (hash == lastSyncedHash) return
+        lastSyncedHash = hash
+        coroutineScope.launch(Dispatchers.IO) {
+            syncManager.pushEntry(entry)
+        }
+    }
+
+    private val remoteDateFormat = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).apply {
+        timeZone = java.util.TimeZone.getTimeZone("UTC")
+    }
+
+    internal suspend fun syncFromRemote() {
+        val remoteEntries = syncManager.pullRecent()
+        if (remoteEntries.isEmpty()) return
+
+        var changed = false
+        withContext(Dispatchers.Main) {
+            remoteEntries.forEach { remote ->
+                val text = remote.formats.firstOrNull { it.mime_type == "text/plain" }?.data
+                val imageFormat = remote.formats.firstOrNull { it.mime_type.startsWith("image/") }
+                
+                val timestamp = try {
+                    remoteDateFormat.parse(remote.created_at)?.time
+                } catch (e: Exception) {
+                    null
+                } ?: System.currentTimeMillis()
+
+                if (text != null) {
+                    if (clipboardHistory.none { it.text == text }) {
+                        clipboardHistory.add(ClipboardEntry(
+                            timestamp = timestamp,
+                            pinned = false,
+                            text = text,
+                            uri = null,
+                            mimeTypes = listOf("text/plain")
+                        ))
+                        changed = true
+                    }
+                } else if (imageFormat?.data_base64 != null) {
+                    // Handle remote image
+                    val bytes = try {
+                        android.util.Base64.decode(imageFormat.data_base64, android.util.Base64.DEFAULT)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (bytes != null) {
+                        val md5Hex = MessageDigest.getInstance("MD5").digest(bytes).joinToString("") { "%02x".format(it) }
+                        val extension = imageFormat.mime_type.substringAfter("/", "img")
+                        val fileName = "$md5Hex.$extension"
+                        val file = File(context.clipboardDir, fileName)
+                        if (!file.exists()) {
+                            context.clipboardDir.mkdirs()
+                            file.writeBytes(bytes)
+                            ClipboardUtil.generateThumbnail(file)
+                        }
+                        
+                        if (clipboardHistory.none { it.backingFile == fileName }) {
+                            clipboardHistory.add(ClipboardEntry(
+                                timestamp = timestamp,
+                                pinned = false,
+                                text = null,
+                                uri = null,
+                                backingFile = fileName,
+                                sizeMb = bytes.size / (1024f * 1024f),
+                                mimeTypes = listOf(imageFormat.mime_type)
+                            ))
+                            changed = true
+                        }
+                    }
+                }
+            }
+            if (changed) {
+                clipboardHistory.sortByDescending { it.timestamp }
+                saveClipboard()
+            }
+        }
+    }
 
     init {
         coroutineScope.launch {
@@ -658,6 +771,14 @@ class ClipboardHistoryManager(val context: Context, val coroutineScope: Lifecycl
             onClipboardImportedFlow.collectLatest {
                 coroutineScope.ensureActive()
                 onClipboardImported(it)
+            }
+        }
+        coroutineScope.launch(Dispatchers.IO) {
+            while (true) {
+                if (context.getSettingBlocking(ClipboardRemoteSyncEnabled)) {
+                    syncFromRemote()
+                }
+                delay(30_000)
             }
         }
     }
@@ -1021,7 +1142,12 @@ val ClipboardHistoryAction = Action(
         val unlocked = !manager.isDeviceLocked()
         val clipboardHistoryManager = persistent as ClipboardHistoryManager
 
-        manager.getLifecycleScope().launch { clipboardHistoryManager.pruneOldItems() }
+        manager.getLifecycleScope().launch {
+            clipboardHistoryManager.pruneOldItems()
+            if (manager.getContext().getSettingBlocking(ClipboardRemoteSyncEnabled)) {
+                clipboardHistoryManager.syncFromRemote()
+            }
+        }
         object : ActionWindow() {
             @Composable
             override fun windowName(): String {
@@ -1429,6 +1555,38 @@ val ClipboardHistoryAction = Action(
                 title = R.string.action_clipboard_manager_settings_skip_delete_confirmation,
                 setting = ClipboardSkipDeleteConfirmation
             ).copy(visibilityCheck = { useDataStoreValue(ClipboardHistoryEnabled) }),
+
+            UserSetting(
+                name = R.string.action_clipboard_manager_remote_sync_title,
+                component = {
+                    val context = LocalContext.current
+                    Column {
+                        SettingToggleDataStore(
+                            title = stringResource(R.string.action_clipboard_manager_remote_sync_enable),
+                            setting = ClipboardRemoteSyncEnabled
+                        )
+
+                        if (useDataStoreValue(ClipboardRemoteSyncEnabled)) {
+                            org.futo.inputmethod.latin.uix.settings.SettingTextField(
+                                title = stringResource(R.string.action_clipboard_manager_remote_sync_server_url),
+                                field = ClipboardRemoteSyncServerUrl,
+                                placeholder = "https://example.com"
+                            )
+                            org.futo.inputmethod.latin.uix.settings.SettingTextField(
+                                title = stringResource(R.string.action_clipboard_manager_remote_sync_token),
+                                field = ClipboardRemoteSyncToken,
+                                placeholder = "token"
+                            )
+                            org.futo.inputmethod.latin.uix.settings.SettingTextField(
+                                title = stringResource(R.string.action_clipboard_manager_remote_sync_device_name),
+                                field = ClipboardRemoteSyncDeviceName,
+                                placeholder = android.os.Build.MODEL
+                            )
+                        }
+                    }
+                },
+                visibilityCheck = { useDataStoreValue(ClipboardHistoryEnabled) }
+            ),
         )
     )
 )

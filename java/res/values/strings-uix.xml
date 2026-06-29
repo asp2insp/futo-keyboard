@@ -103,6 +103,12 @@
 
     <string name="action_clipboard_manager_settings_show_quick_clips">Show recently copied text in suggestion bar</string>
 
+    <string name="action_clipboard_manager_remote_sync_title">Remote Sync</string>
+    <string name="action_clipboard_manager_remote_sync_enable">Enable Remote Sync</string>
+    <string name="action_clipboard_manager_remote_sync_server_url">Server URL</string>
+    <string name="action_clipboard_manager_remote_sync_token">Bearer Token</string>
+    <string name="action_clipboard_manager_remote_sync_device_name">Device Name</string>
+
     <!-- For keyboard modes action -->
     <string name="action_keyboard_modes_title">Keyboard Modes</string>
     <string name="action_keyboard_modes_go_back">Go back</string>
