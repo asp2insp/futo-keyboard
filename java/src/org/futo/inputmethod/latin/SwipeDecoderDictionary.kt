@@ -271,7 +271,8 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
             CodenameParseJson.decodeFromString<ModelMetadata>(content).codename
 
         private val createdFiles = mutableSetOf<String>()
-        fun getFilePath(context: Context, assetName: String): String {
+        private val fileLock = Any()
+        fun getFilePath(context: Context, assetName: String): String = synchronized(fileLock) {
             if(assetName.isEmpty()) return ""
 
             val assets = context.assets
@@ -319,6 +320,7 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
     }
 
     var decoder: SwipeDecoder? = null
+    private var decoderInitFailed = false
 
     object BeamValues {
         const val shortBeam = 32
@@ -327,19 +329,29 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
         const val highestBeam = 300
     }
 
-    private fun getOrInitDecoder(): SwipeDecoder = decoder ?: run {
-        val swipeModelPath = getFilePath(context, SWIPE_MODEL)
+    private fun getOrInitDecoder(): SwipeDecoder? = synchronized(this) {
+        if (decoderInitFailed) return null
 
-        val decoder = SwipeDecoder(
-            encoderPath = swipeModelPath,
-            beamWidth = BeamValues.highestBeam,
-            useExpansion = false, // ITrie contains expanded entries already
-        )
+        decoder ?: run {
+            try {
+                val swipeModelPath = getFilePath(context, SWIPE_MODEL)
 
-        this.decoder = decoder
-        applyPendingLayoutInfo()
+                val decoder = SwipeDecoder(
+                    encoderPath = swipeModelPath,
+                    beamWidth = BeamValues.highestBeam,
+                    useExpansion = false, // ITrie contains expanded entries already
+                )
 
-        return decoder
+                this.decoder = decoder
+                applyPendingLayoutInfo()
+
+                decoder
+            } catch (e: Exception) {
+                Log.e("SwipeDecoderDictionary", "Failed to initialize SwipeDecoder", e)
+                decoderInitFailed = true
+                null
+            }
+        }
     }
 
     override fun getNextValidCodePoints(composedData: ComposedData?): ArrayList<Int> {
@@ -349,10 +361,10 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
     private fun getPredictions(
         composedData: ComposedData,
         ngramContext: NgramContext?
-    ): ArrayList<SuggestedWords.SuggestedWordInfo>? {
+    ): ArrayList<SuggestedWords.SuggestedWordInfo>? = synchronized(this) {
         if(true) return null
 
-        val decoder = getOrInitDecoder()
+        val decoder = getOrInitDecoder() ?: return null
         val wordsContext = ngramContext?.fullContext?.split(' ')?.takeLast(10) ?: emptyList()
         decoder.setContext(wordsContext)
 
@@ -389,7 +401,7 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
         ngramContext: NgramContext?,
         useHighBeam: Boolean,
         trieWeights: FloatArray
-    ): ArrayList<SuggestedWords.SuggestedWordInfo>? {
+    ): ArrayList<SuggestedWords.SuggestedWordInfo>? = synchronized(this) {
         if(context.getSetting(LegacySwipeSetting) == true) return null
 
         if(!composedData.mIsBatchMode && composedData.mInputPointers.pointerSize == 0 && composedData.mTypedWord.isEmpty()) {
@@ -446,7 +458,7 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
             ?.takeLast(10)
             ?: emptyList()
 
-        val decoder = getOrInitDecoder()
+        val decoder = getOrInitDecoder() ?: return null
         decoder.setContext(wordsContext)
         appliedTrieWeights = trieWeights
 
@@ -522,28 +534,34 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
 
     data class PendingLayoutInfo(val layout: LayoutInfoForModel, val tries: List<Long>)
     private var pendingLayoutInfo: PendingLayoutInfo? = null
-    private fun applyPendingLayoutInfo() {
+    private fun applyPendingLayoutInfo() = synchronized(this) {
         decoder?.let { d ->
             pendingLayoutInfo?.let { pend ->
-                //Log.d("SwipeDecoderDictionary", "Applying layout info: $pend")
-                d.setMode(
-                    letters=pend.layout.letters,
-                    cx=pend.layout.xs.toFloatArray(),
-                    cy=pend.layout.ys.toFloatArray(),
-                    tries=pend.tries.toLongArray(),
-                    decoderPath=getFilePath(context, pend.layout.decoder),
-                    lmModelPath=getFilePath(context, pend.layout.lm),
-                    lmVocabPath=getFilePath(context, vocabFor(pend.layout.lm))
-                )
-                appliedScoring.value = d.scoring
-                appliedLayoutInfo = pend.layout
-                appliedTries = pend.tries.toLongArray()
+                try {
+                    //Log.d("SwipeDecoderDictionary", "Applying layout info: $pend")
+                    d.setMode(
+                        letters=pend.layout.letters,
+                        cx=pend.layout.xs.toFloatArray(),
+                        cy=pend.layout.ys.toFloatArray(),
+                        tries=pend.tries.toLongArray(),
+                        decoderPath=getFilePath(context, pend.layout.decoder),
+                        lmModelPath=getFilePath(context, pend.layout.lm),
+                        lmVocabPath=getFilePath(context, vocabFor(pend.layout.lm))
+                    )
+                    appliedScoring.value = d.scoring
+                    appliedLayoutInfo = pend.layout
+                    appliedTries = pend.tries.toLongArray()
+                } catch (e: Exception) {
+                    Log.e("SwipeDecoderDictionary", "Failed to set mode for SwipeDecoder", e)
+                    decoder = null
+                    decoderInitFailed = true
+                }
             }
             pendingLayoutInfo = null
         }
     }
 
-    fun updateKeyboard(pendingLayoutInfo: PendingLayoutInfo) {
+    fun updateKeyboard(pendingLayoutInfo: PendingLayoutInfo) = synchronized(this) {
         this.pendingLayoutInfo = pendingLayoutInfo
         applyPendingLayoutInfo()
     }
@@ -552,9 +570,13 @@ class SwipeDecoderDictionary(val context: Context, val locale: Locale) : Diction
         return false
     }
 
-    fun invalidateTries() {
+    fun invalidateTries() = synchronized(this) {
         if(appliedTries?.isEmpty() != false) return
-        decoder?.setMode(tries = emptyList<Long>().toLongArray())
+        try {
+            decoder?.setMode(tries = emptyList<Long>().toLongArray())
+        } catch (e: Exception) {
+            Log.e("SwipeDecoderDictionary", "Failed to invalidate tries", e)
+        }
         appliedTries = null
     }
 }
